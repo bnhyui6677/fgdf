@@ -2,12 +2,13 @@
 set -euo pipefail
 
 # =============================
-# Enhanced Multi-VM Manager v2.1
+# Enhanced Multi-VM Manager v2.2
 # =============================
 
 # Global variables
-VERSION="2.1"
+VERSION="2.2"
 KVM_AVAILABLE=false
+QEMU_CMD=()
 
 # Function to display header
 display_header() {
@@ -208,8 +209,23 @@ load_vm_config() {
     
     if [[ -f "$config_file" ]]; then
         # Clear previous variables
-        unset VM_NAME OS_TYPE OS_VERSION CODENAME IMG_URL HOSTNAME USERNAME PASSWORD
-        unset DISK_SIZE MEMORY CPUS SSH_PORT GUI_MODE PORT_FORWARDS IMG_FILE SEED_FILE CREATED
+        VM_NAME=""
+        OS_TYPE=""
+        OS_VERSION=""
+        CODENAME=""
+        IMG_URL=""
+        HOSTNAME=""
+        USERNAME=""
+        PASSWORD=""
+        DISK_SIZE=""
+        MEMORY=""
+        CPUS=""
+        SSH_PORT=""
+        GUI_MODE=""
+        PORT_FORWARDS=""
+        IMG_FILE=""
+        SEED_FILE=""
+        CREATED=""
         
         # shellcheck source=/dev/null
         source "$config_file"
@@ -270,8 +286,6 @@ download_image() {
     echo
     
     local wget_opts=("--progress=bar:force:noscroll" "-O" "$output.tmp")
-    
-    # Add timeout and retry options
     wget_opts+=("--timeout=60" "--tries=3" "--continue")
     
     if wget "${wget_opts[@]}" "$url" 2>&1; then
@@ -297,7 +311,6 @@ generate_password_hash() {
     fi
     
     if [[ -z "$hash" ]]; then
-        # Fallback: use Python if available
         if command -v python3 &> /dev/null; then
             hash=$(python3 -c "import crypt; print(crypt.crypt('$password', crypt.mksalt(crypt.METHOD_SHA512)))" 2>/dev/null)
         fi
@@ -340,7 +353,6 @@ create_new_vm() {
     local os_keys=()
     local i=1
     
-    # Sort and display OS options
     while IFS= read -r os; do
         os_keys+=("$os")
         printf "  %2d) %s\n" "$i" "$os"
@@ -664,33 +676,31 @@ EOF
     return 0
 }
 
-# Function to build QEMU command
-build_qemu_command() {
+# Function to build QEMU command for foreground
+build_qemu_command_foreground() {
     local vm_name=$1
     
-    QEMU_CMD=(qemu-system-x86_64)
+    QEMU_CMD=()
+    QEMU_CMD+=(qemu-system-x86_64)
     
     # Machine type
     QEMU_CMD+=(-machine type=q35)
     
     # Add KVM if available
     if $KVM_AVAILABLE; then
-        QEMU_CMD+=(-enable-kvm -cpu host)
+        QEMU_CMD+=(-enable-kvm)
+        QEMU_CMD+=(-cpu host)
     else
         QEMU_CMD+=(-cpu qemu64)
     fi
     
     # Basic configuration
-    QEMU_CMD+=(
-        -name "$vm_name"
-        -m "$MEMORY"
-        -smp "$CPUS"
-    )
+    QEMU_CMD+=(-name "$vm_name")
+    QEMU_CMD+=(-m "$MEMORY")
+    QEMU_CMD+=(-smp "$CPUS")
     
-    # Disk drives
-    QEMU_CMD+=(
-        -drive "file=$IMG_FILE,format=qcow2,if=virtio,cache=writeback,aio=native"
-    )
+    # Disk drives - FIXED: removed aio=native, using compatible options
+    QEMU_CMD+=(-drive "file=$IMG_FILE,format=qcow2,if=virtio,cache=writeback")
     
     # Add seed drive if exists
     if [[ -f "$SEED_FILE" ]]; then
@@ -713,27 +723,88 @@ build_qemu_command() {
         done
     fi
     
-    QEMU_CMD+=(
-        -device virtio-net-pci,netdev=net0
-        -netdev "$netdev_opts"
-    )
+    QEMU_CMD+=(-device virtio-net-pci,netdev=net0)
+    QEMU_CMD+=(-netdev "$netdev_opts")
     
-    # Display configuration
-    if [[ "$GUI_MODE" == true ]]; then
-        QEMU_CMD+=(-vga virtio -display gtk)
+    # Display configuration - foreground mode
+    if [[ "$GUI_MODE" == "true" ]]; then
+        QEMU_CMD+=(-vga virtio)
+        QEMU_CMD+=(-display gtk)
     else
-        QEMU_CMD+=(-nographic -serial mon:stdio)
+        QEMU_CMD+=(-nographic)
+        QEMU_CMD+=(-serial mon:stdio)
     fi
     
     # Performance enhancements
-    QEMU_CMD+=(
-        -device virtio-balloon-pci,id=balloon0
-        -object rng-random,filename=/dev/urandom,id=rng0
-        -device virtio-rng-pci,rng=rng0
-    )
+    QEMU_CMD+=(-device virtio-balloon-pci,id=balloon0)
+    QEMU_CMD+=(-object rng-random,filename=/dev/urandom,id=rng0)
+    QEMU_CMD+=(-device virtio-rng-pci,rng=rng0)
 }
 
-# Function to start a VM
+# Function to build QEMU command for background
+build_qemu_command_background() {
+    local vm_name=$1
+    
+    QEMU_CMD=()
+    QEMU_CMD+=(qemu-system-x86_64)
+    
+    # Machine type
+    QEMU_CMD+=(-machine type=q35)
+    
+    # Add KVM if available
+    if $KVM_AVAILABLE; then
+        QEMU_CMD+=(-enable-kvm)
+        QEMU_CMD+=(-cpu host)
+    else
+        QEMU_CMD+=(-cpu qemu64)
+    fi
+    
+    # Basic configuration
+    QEMU_CMD+=(-name "$vm_name")
+    QEMU_CMD+=(-m "$MEMORY")
+    QEMU_CMD+=(-smp "$CPUS")
+    
+    # Disk drives - FIXED: compatible options for background
+    QEMU_CMD+=(-drive "file=$IMG_FILE,format=qcow2,if=virtio,cache=writeback")
+    
+    # Add seed drive if exists
+    if [[ -f "$SEED_FILE" ]]; then
+        QEMU_CMD+=(-drive "file=$SEED_FILE,format=raw,if=virtio,readonly=on")
+    fi
+    
+    QEMU_CMD+=(-boot order=c)
+    
+    # Build network configuration
+    local netdev_opts="user,id=net0,hostfwd=tcp::${SSH_PORT}-:22"
+    
+    if [[ -n "${PORT_FORWARDS:-}" ]]; then
+        IFS=',' read -ra forwards <<< "$PORT_FORWARDS"
+        for forward in "${forwards[@]}"; do
+            forward=$(echo "$forward" | tr -d ' ')
+            if [[ "$forward" =~ ^[0-9]+:[0-9]+$ ]]; then
+                IFS=':' read -r host_port guest_port <<< "$forward"
+                netdev_opts+=",hostfwd=tcp::${host_port}-:${guest_port}"
+            fi
+        done
+    fi
+    
+    QEMU_CMD+=(-device virtio-net-pci,netdev=net0)
+    QEMU_CMD+=(-netdev "$netdev_opts")
+    
+    # Background mode - no display, daemonize
+    QEMU_CMD+=(-display none)
+    QEMU_CMD+=(-daemonize)
+    
+    # Optional: enable monitor via unix socket for management
+    QEMU_CMD+=(-monitor "unix:$VM_DIR/$vm_name.monitor,server,nowait")
+    
+    # Performance enhancements
+    QEMU_CMD+=(-device virtio-balloon-pci,id=balloon0)
+    QEMU_CMD+=(-object rng-random,filename=/dev/urandom,id=rng0)
+    QEMU_CMD+=(-device virtio-rng-pci,rng=rng0)
+}
+
+# Function to start a VM in foreground
 start_vm() {
     local vm_name=$1
     
@@ -786,24 +857,27 @@ start_vm() {
     echo "════════════════════════════════════════════"
     echo
     
-    if [[ "$GUI_MODE" == false ]]; then
+    if [[ "$GUI_MODE" != "true" ]]; then
         print_status "INFO" "Console mode - Press Ctrl+A, X to exit QEMU"
     fi
     
-    # Build and execute QEMU command
-    build_qemu_command "$vm_name"
+    # Build QEMU command
+    build_qemu_command_foreground "$vm_name"
     
     print_status "INFO" "Launching QEMU..."
     echo
     
     # Run QEMU
-    "${QEMU_CMD[@]}" || {
-        print_status "ERROR" "QEMU exited with error"
-        return 1
-    }
+    "${QEMU_CMD[@]}"
+    local exit_code=$?
     
     echo
-    print_status "INFO" "VM '$vm_name' has been shut down"
+    if [ $exit_code -eq 0 ]; then
+        print_status "INFO" "VM '$vm_name' has been shut down"
+    else
+        print_status "ERROR" "QEMU exited with error code: $exit_code"
+        return 1
+    fi
 }
 
 # Function to start VM in background
@@ -824,52 +898,49 @@ start_vm_background() {
         return 1
     fi
     
-    if ! is_port_available "$SSH_PORT"; then
-        print_status "ERROR" "SSH port $SSH_PORT is already in use"
-        return 1
+    if [[ ! -f "$SEED_FILE" ]]; then
+        print_status "WARN" "Seed file not found, recreating..."
+        setup_vm_image
     fi
     
-    build_qemu_command "$vm_name"
-    
-    # Modify command for background mode
-    local bg_cmd=()
-    local skip_next=false
-    
-    for arg in "${QEMU_CMD[@]}"; do
-        if $skip_next; then
-            skip_next=false
-            continue
+    if ! is_port_available "$SSH_PORT"; then
+        print_status "ERROR" "SSH port $SSH_PORT is already in use"
+        local new_port
+        new_port=$(find_available_port "$SSH_PORT")
+        read -p "$(print_status "INPUT" "Use port $new_port instead? (Y/n): ")" use_new
+        if [[ ! "$use_new" =~ ^[Nn]$ ]]; then
+            SSH_PORT="$new_port"
+            save_vm_config
+        else
+            return 1
         fi
-        case "$arg" in
-            -nographic|-serial|-display)
-                skip_next=true
-                continue
-                ;;
-            mon:stdio|gtk)
-                continue
-                ;;
-            *)
-                bg_cmd+=("$arg")
-                ;;
-        esac
-    done
-    
-    bg_cmd+=(-daemonize -display none)
+    fi
     
     print_status "INFO" "Starting VM '$vm_name' in background..."
     
-    if "${bg_cmd[@]}" 2>/dev/null; then
+    # Build background QEMU command
+    build_qemu_command_background "$vm_name"
+    
+    # Run QEMU in background
+    if "${QEMU_CMD[@]}" 2>/dev/null; then
         sleep 2
+        
         if is_vm_running "$vm_name"; then
+            echo
             print_status "SUCCESS" "VM '$vm_name' started in background"
-            print_status "INFO" "SSH: ssh -p $SSH_PORT $USERNAME@localhost"
-            print_status "INFO" "Password: $PASSWORD"
+            echo "════════════════════════════════════════════"
+            echo "  SSH      : ssh -p $SSH_PORT $USERNAME@localhost"
+            echo "  Username : $USERNAME"
+            echo "  Password : $PASSWORD"
+            echo "════════════════════════════════════════════"
         else
             print_status "ERROR" "VM may have failed to start"
+            print_status "INFO" "Try starting in foreground mode to see errors"
             return 1
         fi
     else
         print_status "ERROR" "Failed to start VM"
+        print_status "INFO" "Try starting in foreground mode to see errors"
         return 1
     fi
 }
@@ -877,13 +948,13 @@ start_vm_background() {
 # Function to check if VM is running
 is_vm_running() {
     local vm_name=$1
-    pgrep -f "qemu-system-x86_64.*-name $vm_name( |$)" >/dev/null 2>&1
+    pgrep -f "qemu-system-x86_64.*-name ${vm_name}( |$)" >/dev/null 2>&1
 }
 
 # Function to get VM PID
 get_vm_pid() {
     local vm_name=$1
-    pgrep -f "qemu-system-x86_64.*-name $vm_name( |$)" 2>/dev/null | head -1
+    pgrep -f "qemu-system-x86_64.*-name ${vm_name}( |$)" 2>/dev/null | head -1
 }
 
 # Function to stop a running VM
@@ -925,6 +996,9 @@ stop_vm() {
         fi
     fi
     
+    # Cleanup monitor socket if exists
+    [[ -f "$VM_DIR/$vm_name.monitor" ]] && rm -f "$VM_DIR/$vm_name.monitor"
+    
     if ! is_vm_running "$vm_name"; then
         print_status "SUCCESS" "VM '$vm_name' stopped"
     else
@@ -957,7 +1031,7 @@ delete_vm() {
     read -p "$(print_status "INPUT" "Type 'DELETE' to confirm: ")" confirm
     
     if [[ "$confirm" == "DELETE" ]]; then
-        rm -f "$IMG_FILE" "$SEED_FILE" "$VM_DIR/$vm_name.conf"
+        rm -f "$IMG_FILE" "$SEED_FILE" "$VM_DIR/$vm_name.conf" "$VM_DIR/$vm_name.monitor"
         print_status "SUCCESS" "VM '$vm_name' has been deleted"
     else
         print_status "INFO" "Deletion cancelled"
@@ -1121,10 +1195,10 @@ edit_vm_config() {
                 done
                 ;;
             7)
-                if [[ "$GUI_MODE" == true ]]; then
-                    GUI_MODE=false
+                if [[ "$GUI_MODE" == "true" ]]; then
+                    GUI_MODE="false"
                 else
-                    GUI_MODE=true
+                    GUI_MODE="true"
                 fi
                 print_status "SUCCESS" "GUI mode set to: $GUI_MODE"
                 ;;
