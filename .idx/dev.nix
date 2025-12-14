@@ -12,7 +12,7 @@
     cdrkit
     cloud-utils
     qemu
-    npm
+    apt
   ];
 
   env = {
