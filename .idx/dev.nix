@@ -12,9 +12,7 @@
     cdrkit
     cloud-utils
     qemu
-    apt
-    nodejs
-    neofetch 
+    
   ];
 
   env = {
